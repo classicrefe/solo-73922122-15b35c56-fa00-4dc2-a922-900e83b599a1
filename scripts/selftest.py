@@ -176,6 +176,28 @@ def main() -> int:
     status, page = browser.get(f"/wafers/{wafer_id}?step=6&did=D102")
     check("页面展示待定", status == 200 and "待定" in page)
 
+    # 绘图只用一套全局可行方案：叠加图与单工序换算图同方案，切换工序也不变
+    locators0 = api(browser, f"/api/wafers/{wafer_id}/locators")
+    chosen_by_seq = {item["seq"]: item["chosen_transform"] for item in locators0["steps"]}
+    check(
+        "每道工序都有唯一绘图变换",
+        all(label for label in chosen_by_seq.values()),
+        str(chosen_by_seq),
+    )
+    _, page_step3 = browser.get(f"/wafers/{wafer_id}?step=3")
+    _, page_step6 = browser.get(f"/wafers/{wafer_id}?step=6")
+    check(
+        "同一修订下切换工序沿用同一套绘图方案",
+        chosen_by_seq[3] in page_step3 and chosen_by_seq[6] in page_step6,
+        f"{chosen_by_seq[3]} / {chosen_by_seq[6]}",
+    )
+    check("页面声明只采用同一套全局可行方案", "同一套全局可行方案" in page_step6)
+    check(
+        "接口修订号与页面修订号一致",
+        f"修订 r{locators0['revision']}" in page_step6,
+        f"r{locators0['revision']}",
+    )
+
     locators = api(browser, f"/api/wafers/{wafer_id}/locators")
     steps_by_seq = {s["seq"]: s for s in locators["steps"]}
 
@@ -206,6 +228,7 @@ def main() -> int:
     locators = api(browser, f"/api/wafers/{wafer_id}/locators")
     steps_by_seq = {s["seq"]: s for s in locators["steps"]}
     c1_pack = _find_locator(steps_by_seq[6], "C1")
+    check("补点后修订号回到一致基线", locators["revision"] == 2, str(locators["revision"]))
 
     # 3) 更正封装 C1 -> (4,4)：D104 由待定变为确定 (5,5)
     status, _ = browser.post_form(
@@ -238,6 +261,14 @@ def main() -> int:
         [kept["row"], kept["col"]] == [4, 4],
         f'{kept["row"]},{kept["col"]}',
     )
+
+    # 删除后取数必须返回正常的未找到页，而不是半残页面或 500
+    status, _ = browser.post_form(f"/wafers/{wafer_id}/delete", {})
+    check("删除请求成功", status in (302, 303), f"HTTP {status}")
+    status, body = browser.get(f"/wafers/{wafer_id}")
+    check("删除后详情页返回未找到页", status == 404 and "没有这条记录" in body, f"HTTP {status}")
+    status, _ = browser.get(f"/api/wafers/{wafer_id}/defects")
+    check("删除后接口返回 404", status == 404, f"HTTP {status}")
 
     failed = [c for c in CHECKS if not c[1]]
     print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} 项通过")

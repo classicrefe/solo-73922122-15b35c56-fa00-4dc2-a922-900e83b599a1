@@ -28,6 +28,11 @@
   {% endif %}
 
   <h3>各工序可行变换</h3>
+  <p class="muted small">
+    方案总数与下表缺陷候选格、待定判定均以全部 {{ feasibility.scheme_count }} 套可行方案为准；
+    页面上的叠加图与单工序换算图只采用同一套全局可行方案（下表高亮项），
+    同一修订下切换工序也沿用这套方案，保证本应同格的缺陷不会被画到两格。
+  </p>
   <table class="table compact">
     <thead>
       <tr><th>#</th><th>工序</th><th>可行变换</th><th>跨工序同号定位点</th></tr>
@@ -42,7 +47,8 @@
             {% if step.is_baseline %}<span class="badge base">基准</span>{% endif %}
           </td>
           <td>
-            {% for label in f.labels %}<span class="chip">{{ label }}</span>{% else %}<span class="badge bad">无</span>{% endfor %}
+            {% for label in f.labels %}<span class="chip{% if chosen_labels.get(step.id) == label %} chosen{% endif %}">{{ label }}</span>{% else %}<span class="badge bad">无</span>{% endfor %}
+            {% if chosen_labels.get(step.id) %}<div class="muted small">绘图采用：{{ chosen_labels.get(step.id) }}</div>{% endif %}
           </td>
           <td class="small">
             同号点：{{ f.shared_locators|join('、') or '—' }}
@@ -178,11 +184,11 @@
       {{ render_grid(grid) }}
     </div>
     <div>
-      <h4>换算到基准图（取第一个可行变换示意）</h4>
+      <h4>换算到基准图（全局绘图方案中的本工序变换）</h4>
       {% if mapped %}
         {{ render_grid(mapped) }}
         <p class="muted small">
-          示意用变换：{{ mapped_label }}。缺陷的实际查询结果以上表为准；待定的缺陷在这里只画一个可能的落点。
+          绘图方案变换：{{ mapped_label }}（与下方叠加图同属一套全局可行方案）。缺陷的实际查询结果以上表为准；待定的缺陷在这里只画该方案下的落点，候选格仍以全部可行方案为准。
         </p>
       {% else %}
         <p class="muted">无可行方案，无法换算。</p>
@@ -194,8 +200,9 @@
 <section class="panel">
   <h4>全部工序叠加到基准坐标系</h4>
   <p class="muted small">
-    基准工序按原坐标画；其余工序取各自的第一个可行变换换算后叠加（<span class="mono">D101</span>
-    为基准缺陷，紫色为其他工序的缺陷）。虚化的缺陷为待定，只表示一个可能的落点。
+    基准工序按原坐标画；其余工序按同一套全局可行方案中各自的变换换算后叠加（<span class="mono">D101</span>
+    为基准缺陷，紫色为其他工序的缺陷）。虚化的缺陷为待定，只表示该方案下的一个可能落点；
+    本图与各工序的换算图共用同一套方案，同号定位点对齐后本应同格的缺陷必然落在同一格。
   </p>
   {{ render_grid(overlay) }}
   <div class="legend">

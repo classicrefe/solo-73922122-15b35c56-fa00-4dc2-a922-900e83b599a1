@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .geometry import Transform, apply_transform
+from .geometry import IDENTITY, Transform, apply_transform, transform_label
 from .gridview import CellMark, Grid
 from .model import Analysis, Step, Wafer
 
@@ -20,16 +20,24 @@ class Layer:
 
 
 def step_layer(analysis: Analysis, step: Step) -> Layer:
-    """把某工序的所有点按“第一个可行变换”换算到基准坐标。"""
-    transforms = analysis.transforms(step)
-    transform = transforms[0] if transforms else (False, 0)
+    """把某工序的所有点按全局可行方案中该工序的变换换算到基准坐标。
+
+    与单工序换算图、叠加图共用同一套完整方案（``Analysis.chosen_transform``），
+    不会再出现各工序各自挑选变换、把本应同格的缺陷画到两格的情况。
+    """
     n = analysis.wafer.grid_size
-    label = analysis.feasibility.for_step(step.id)
+    transform = analysis.chosen_transform(step)
+    if transform is None:
+        # 无解（正常保存流程不会出现）：不换算，只把原始点标成“无可行变换”。
+        transform = IDENTITY
+        label_text = "无可行变换"
+    else:
+        label_text = transform_label(transform)
     return Layer(
         step_id=step.id,
         name=step.name,
         transform=transform,
-        label=label.labels[0] if label and label.labels else "无可行变换",
+        label=label_text,
         locators=[
             (loc.pid, *apply_transform(transform, loc.row, loc.col, n)) for loc in step.locators
         ],

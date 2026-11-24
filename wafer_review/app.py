@@ -14,7 +14,7 @@ from flask import (
     url_for,
 )
 
-from .db import connect, init_db
+from .db import init_db, snapshot
 from .display import mapped_grid, transform_label
 from .gridview import build_grid
 from .model import NoSolutionError, WaferError, analyze
@@ -53,19 +53,20 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/")
     def index():
-        with connect(app.config["DATABASE"]) as conn:
+        # 列表与逐片可行性分析都在同一个只读快照里完成，避免取数过程中被写入打断。
+        with snapshot(app.config["DATABASE"]) as conn:
             wafers = list_wafers(conn)
-        summaries = []
-        for wafer in wafers:
-            analysis = analyze(wafer)
-            summaries.append(
-                {
-                    "wafer": wafer,
-                    "solvable": analysis.solvable,
-                    "scheme_count": analysis.feasibility.scheme_count,
-                    "defect_total": sum(len(s.defects) for s in wafer.steps),
-                }
-            )
+            summaries = []
+            for wafer in wafers:
+                analysis = analyze(wafer)
+                summaries.append(
+                    {
+                        "wafer": wafer,
+                        "solvable": analysis.solvable,
+                        "scheme_count": analysis.feasibility.scheme_count,
+                        "defect_total": sum(len(s.defects) for s in wafer.steps),
+                    }
+                )
         return render_template("index.html", summaries=summaries)
 
     @app.get("/wafers/new")
@@ -148,47 +149,59 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/wafers/<int:wafer_id>")
     def wafer_detail(wafer_id: int):
-        with connect(app.config["DATABASE"]) as conn:
+        # 整个页面的取数在同一个只读快照事务里完成：修订号、定位点、缺陷与分析
+        # 结果必然来自同一次已提交状态。取数期间其他人仍可写入（WAL 快照隔离，
+        # 不阻塞写事务）；若本快照开始时晶圆已被删除，则正常走未找到页。
+        with snapshot(app.config["DATABASE"]) as conn:
             wafer = load_wafer(conn, wafer_id)
-        if wafer is None:
-            abort(404)
-        analysis = analyze(wafer)
-        step_id_text = request.args.get("step")
-        did = request.args.get("did", "").strip()
-        selected = None
-        if step_id_text:
-            try:
-                selected = wafer.step_by_id(int(step_id_text))
-            except ValueError:
-                selected = None
-        if selected is None and wafer.steps:
-            selected = wafer.steps[0]
+            if wafer is None:
+                abort(404)
+            # 每次打开详情页只做一次配准：枚举一次，页面上所有表格与绘图复用。
+            analysis = analyze(wafer)
+            step_id_text = request.args.get("step")
+            did = request.args.get("did", "").strip()
+            selected = None
+            if step_id_text:
+                try:
+                    selected = wafer.step_by_id(int(step_id_text))
+                except ValueError:
+                    selected = None
+            if selected is None and wafer.steps:
+                selected = wafer.steps[0]
 
-        results = analysis.step_results(selected) if selected else []
-        focus = next((r for r in results if r.did == did), None) if did else None
+            results = analysis.step_results(selected) if selected else []
+            focus = next((r for r in results if r.did == did), None) if did else None
 
-        grid = build_grid(selected, wafer.grid_size) if selected else None
-        mapped = None
-        mapped_label = ""
-        if selected:
-            transforms = analysis.transforms(selected)
-            if transforms:
-                mapped = mapped_grid(selected, transforms[0], wafer.grid_size)
-                mapped_label = transform_label(transforms[0])
+            grid = build_grid(selected, wafer.grid_size) if selected else None
+            mapped = None
+            mapped_label = ""
+            if selected:
+                # 与叠加图共用同一套全局可行方案；同一修订下切换工序也不变。
+                chosen = analysis.chosen_transform(selected)
+                if chosen is not None:
+                    mapped = mapped_grid(selected, chosen, wafer.grid_size)
+                    mapped_label = transform_label(chosen)
 
-        return render_template(
-            "wafer.html",
-            wafer=wafer,
-            feasibility=analysis.feasibility,
-            selected=selected,
-            results=results,
-            focus=focus,
-            queried_did=did,
-            grid=grid,
-            mapped=mapped,
-            mapped_label=mapped_label,
-            overlay=compare_grid(analysis),
-        )
+            # 模板只接收快照内已物化的对象，快照在 with 结束时正常释放。
+            chosen_labels = {
+                step.id: transform_label(chosen)
+                for step in wafer.steps
+                if (chosen := analysis.chosen_transform(step)) is not None
+            }
+            return render_template(
+                "wafer.html",
+                wafer=wafer,
+                feasibility=analysis.feasibility,
+                selected=selected,
+                results=results,
+                focus=focus,
+                queried_did=did,
+                grid=grid,
+                mapped=mapped,
+                mapped_label=mapped_label,
+                overlay=compare_grid(analysis),
+                chosen_labels=chosen_labels,
+            )
 
     def _back(wafer_id: int, step: str, did: str):
         params = {"wafer_id": wafer_id}
@@ -277,64 +290,72 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/api/wafers/<int:wafer_id>/defects")
     def api_defects(wafer_id: int):
-        with connect(app.config["DATABASE"]) as conn:
+        with snapshot(app.config["DATABASE"]) as conn:
             wafer = load_wafer(conn, wafer_id)
-        if wafer is None:
-            abort(404)
-        analysis = analyze(wafer)
-        out = []
-        for step in wafer.steps:
-            for result in analysis.step_results(step):
-                out.append(
-                    {
-                        "step": step.name,
-                        "defect": result.did,
-                        "source": [result.source_row, result.source_col],
-                        "status": result.status,
-                        "coordinate": list(result.coordinate) if result.coordinate else None,
-                        "candidates": [list(c) for c in result.candidates],
-                    }
-                )
-        return {
-            "wafer": wafer.name,
-            "grid_size": wafer.grid_size,
-            "scheme_count": analysis.feasibility.scheme_count,
-            "results": out,
-        }
+            if wafer is None:
+                abort(404)
+            analysis = analyze(wafer)
+            out = []
+            for step in wafer.steps:
+                for result in analysis.step_results(step):
+                    out.append(
+                        {
+                            "step": step.name,
+                            "defect": result.did,
+                            "source": [result.source_row, result.source_col],
+                            "status": result.status,
+                            "coordinate": list(result.coordinate) if result.coordinate else None,
+                            "candidates": [list(c) for c in result.candidates],
+                        }
+                    )
+            payload = {
+                "wafer": wafer.name,
+                "revision": wafer.revision,
+                "grid_size": wafer.grid_size,
+                "scheme_count": analysis.feasibility.scheme_count,
+                "results": out,
+            }
+        return payload
 
     @app.get("/healthz")
     def healthz():
-        with connect(app.config["DATABASE"]) as conn:
+        with snapshot(app.config["DATABASE"]) as conn:
             conn.execute("SELECT 1").fetchone()
         return {"status": "ok"}
 
     @app.get("/api/wafers/<int:wafer_id>/locators")
     def api_locators(wafer_id: int):
-        with connect(app.config["DATABASE"]) as conn:
+        with snapshot(app.config["DATABASE"]) as conn:
             wafer = load_wafer(conn, wafer_id)
-        if wafer is None:
-            abort(404)
-        analysis = analyze(wafer)
-        return {
-            "wafer": wafer.name,
-            "revision": wafer.revision,
-            "scheme_count": analysis.feasibility.scheme_count,
-            "steps": [
-                {
-                    "id": step.id,
-                    "seq": step.seq,
-                    "name": step.name,
-                    "transforms": list(f.labels) if f else [],
-                    "locators": [
-                        {"id": loc.id, "pid": loc.pid, "row": loc.row, "col": loc.col}
-                        for loc in step.locators
-                    ],
-                }
-                for step, f in (
-                    (step, analysis.feasibility.for_step(step.id)) for step in wafer.steps
-                )
-            ],
-        }
+            if wafer is None:
+                abort(404)
+            analysis = analyze(wafer)
+            payload = {
+                "wafer": wafer.name,
+                "revision": wafer.revision,
+                "scheme_count": analysis.feasibility.scheme_count,
+                "steps": [
+                    {
+                        "id": step.id,
+                        "seq": step.seq,
+                        "name": step.name,
+                        "transforms": list(f.labels) if f else [],
+                        "chosen_transform": (
+                            transform_label(analysis.chosen_transform(step))
+                            if analysis.chosen_transform(step) is not None
+                            else None
+                        ),
+                        "locators": [
+                            {"id": loc.id, "pid": loc.pid, "row": loc.row, "col": loc.col}
+                            for loc in step.locators
+                        ],
+                    }
+                    for step, f in (
+                        (step, analysis.feasibility.for_step(step.id)) for step in wafer.steps
+                    )
+                ],
+            }
+        return payload
 
     @app.errorhandler(404)
     def not_found(_exc):

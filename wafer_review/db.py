@@ -72,6 +72,23 @@ def connect(db_path: str | Path) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+@contextmanager
+def snapshot(db_path: str | Path) -> Iterator[sqlite3.Connection]:
+    """打开一次只读快照事务。
+
+    ``BEGIN`` 之后的所有 SELECT 都基于同一个已提交版本（WAL 下为快照隔离）：
+    即使其他访问者在本事务期间补点、改点、撤点甚至删除整片晶圆，本事务读到的
+    修订号、定位点与缺陷仍彼此一致，页面不会用旧修订号显示新结果；写操作也
+    不会被阻塞，可以正常保存。事务结束即释放快照，不会长期滞留 WAL。
+    """
+    with connect(db_path) as conn:
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            conn.execute("COMMIT")
+
+
 def init_db(db_path: str | Path) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with connect(db_path) as conn:

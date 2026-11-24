@@ -108,6 +108,13 @@ a:hover { text-decoration: underline; }
 }
 .chips { margin-top: 8px; }
 .chip.mono { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; }
+.chip.chosen {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+  box-shadow: 0 0 0 1px rgba(90, 169, 255, .35);
+}
 
 .button {
   display: inline-block;

@@ -121,17 +121,28 @@ class Feasibility:
     solvable: bool
     scheme_count: int
     elapsed_ms: float = 0.0
+    # 枚举到的第一套“每道工序各一个变换”的完整可行方案，按工序下标排列。
+    # 方案总数、缺陷候选格与待定判定仍以全部可行方案为准；该字段只服务于绘图，
+    # 保证叠加图与各工序换算图使用同一套全局可行组合，且在同一修订下保持不变。
+    chosen_scheme: tuple[Transform, ...] = ()
 
     def for_step(self, step_id: int) -> StepFeasibility | None:
         return next((s for s in self.steps if s.step_id == step_id), None)
 
 
-def _enumerate(wafer: Wafer) -> tuple[int, list[set[Transform]], list[frozenset[str]], float]:
-    """枚举全部可行方案，返回方案数、逐工序变换投影、逐工序参与约束的编号、耗时。"""
+def _enumerate(
+    wafer: Wafer,
+) -> tuple[int, list[set[Transform]], list[frozenset[str]], tuple[Transform, ...], float]:
+    """枚举全部可行方案。
+
+    返回方案数、逐工序变换投影、逐工序参与约束的编号、第一套完整可行方案、耗时。
+    完整方案按 D4 枚举顺序确定性产生（基准固定恒等），因此同一份已提交数据每次
+    得到的绘图方案都相同，切换工序也不会变。
+    """
     start = time.perf_counter()
     steps = wafer.steps
     if not steps:
-        return 0, [], [], 0.0
+        return 0, [], [], (), 0.0
     n = wafer.grid_size
     # 编号 -> [(工序下标, (row, col)), ...]
     points: dict[str, list[tuple[int, tuple[int, int]]]] = {}
@@ -160,6 +171,7 @@ def _enumerate(wafer: Wafer) -> tuple[int, list[set[Transform]], list[frozenset[
     projections: list[set[Transform]] = [set() for _ in steps]
     chosen: list[Transform] = []
     scheme_count = 0
+    first_scheme: tuple[Transform, ...] = ()
 
     def consistent(i: int, transform: Transform) -> bool:
         for j in range(i):
@@ -173,9 +185,11 @@ def _enumerate(wafer: Wafer) -> tuple[int, list[set[Transform]], list[frozenset[
         return True
 
     def walk(i: int) -> None:
-        nonlocal scheme_count
+        nonlocal scheme_count, first_scheme
         if i == len(steps):
             scheme_count += 1
+            if not first_scheme:
+                first_scheme = tuple(chosen)
             for k, t in enumerate(chosen):
                 projections[k].add(t)
             return
@@ -188,7 +202,13 @@ def _enumerate(wafer: Wafer) -> tuple[int, list[set[Transform]], list[frozenset[
 
     walk(0)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
-    return scheme_count, projections, [frozenset(s) for s in involved], elapsed_ms
+    return (
+        scheme_count,
+        projections,
+        [frozenset(s) for s in involved],
+        first_scheme,
+        elapsed_ms,
+    )
 
 
 def _build_feasibility(
@@ -197,6 +217,7 @@ def _build_feasibility(
     projections: list[set[Transform]],
     involved: list[frozenset[str]],
     elapsed_ms: float,
+    chosen_scheme: tuple[Transform, ...] = (),
 ) -> Feasibility:
     base_ids = set(wafer.baseline.locator_map())
     step_feas: list[StepFeasibility] = []
@@ -220,12 +241,15 @@ def _build_feasibility(
         solvable=solvable,
         scheme_count=scheme_count,
         elapsed_ms=elapsed_ms,
+        chosen_scheme=chosen_scheme if solvable else (),
     )
 
 
 def compute_feasibility(wafer: Wafer) -> Feasibility:
-    scheme_count, projections, involved, elapsed_ms = _enumerate(wafer)
-    return _build_feasibility(wafer, scheme_count, projections, involved, elapsed_ms)
+    scheme_count, projections, involved, chosen_scheme, elapsed_ms = _enumerate(wafer)
+    return _build_feasibility(
+        wafer, scheme_count, projections, involved, elapsed_ms, chosen_scheme
+    )
 
 
 class Analysis:
@@ -233,11 +257,23 @@ class Analysis:
 
     def __init__(self, wafer: Wafer) -> None:
         self.wafer = wafer
-        scheme_count, projections, involved, elapsed_ms = _enumerate(wafer)
+        (
+            scheme_count,
+            projections,
+            involved,
+            chosen_scheme,
+            elapsed_ms,
+        ) = _enumerate(wafer)
         self.feasibility = _build_feasibility(
-            wafer, scheme_count, projections, involved, elapsed_ms
+            wafer, scheme_count, projections, involved, elapsed_ms, chosen_scheme
         )
         self._transforms = {s.step_id: s.transforms for s in self.feasibility.steps}
+        # 全局唯一绘图方案：step_id -> 该套方案里本工序使用的变换。
+        self._chosen: dict[int, Transform] = {
+            step.id: chosen_scheme[idx]
+            for idx, step in enumerate(wafer.steps)
+            if chosen_scheme
+        }
 
     @property
     def solvable(self) -> bool:
@@ -245,6 +281,10 @@ class Analysis:
 
     def transforms(self, step: Step) -> tuple[Transform, ...]:
         return self._transforms.get(step.id, ())
+
+    def chosen_transform(self, step: Step) -> Transform | None:
+        """绘图专用：返回全局唯一可行方案中该工序的变换；无解时为 None。"""
+        return self._chosen.get(step.id)
 
     def result(self, step: Step, defect: Defect) -> DefectResult:
         transforms = self.transforms(step)
